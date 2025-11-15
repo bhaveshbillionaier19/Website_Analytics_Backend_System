@@ -755,10 +755,4 @@ For production deployment, consider:
 - Add comprehensive test coverage
 - Set up CI/CD pipeline
 
-## License
 
-[Add your license information here]
-
-## Contact
-
-[Add contact information here]
