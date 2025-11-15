@@ -77,33 +77,89 @@ RESTful API for querying and aggregating analytics data from the database. Provi
 
 ## Architecture Decisions
 
-### In-Memory Queue Choice
+### Asynchronous Processing Implementation
 
-For this exercise, we use an **in-memory queue** (Python's `queue.Queue` with file-based persistence) to achieve extremely fast event ingestion. This design choice prioritizes:
+The system implements asynchronous event processing using a **hybrid queue architecture** that combines in-memory speed with file-based persistence for cross-process communication.
 
-1. **Minimal Latency**: Events are queued immediately without database I/O
-2. **Simplicity**: No external dependencies required for the queue
-3. **Fast Response Times**: The Ingestion API returns immediately after queuing
+#### How the Queue Works
 
-**How It Works:**
-- The Ingestion API uses an in-memory queue for speed, with events also written to a file for persistence
-- The Processor reads directly from the file-based queue (since it's a separate process)
-- This hybrid approach provides both speed and cross-process communication
+The asynchronous processing is implemented through a two-layer queue system:
 
-**Real-World Alternatives:**
+1. **Ingestion API Layer (Fast Path)**:
+   - Uses Python's `queue.Queue` (thread-safe in-memory queue) for immediate event storage
+   - Events are simultaneously written to a JSONL (JSON Lines) file (`event_queue.jsonl`) for persistence
+   - This dual-write approach ensures:
+     - **Speed**: In-memory queue provides instant queuing (microseconds)
+     - **Durability**: File persistence ensures events survive process restarts
+     - **Cross-Process Communication**: File allows separate processes to share the queue
 
-In production environments, you would typically use:
+2. **Processor Layer (Consumer)**:
+   - Reads directly from the file-based queue (since it runs in a separate process)
+   - Uses file locking (`fcntl` on Linux/Mac, OS-level on Windows) to prevent race conditions
+   - Implements a polling loop with timeout to check for new events
+   - Removes processed events from the queue file atomically
+
+#### Implementation Details
+
+```python
+# Ingestion API: Fast queuing
+event_queue.put(event_data)  # In-memory + file write
+return {"message": "Event received"}  # Immediate response
+
+# Processor: Background consumption
+while True:
+    event = event_queue.get(timeout=1)  # Read from file
+    process_event(event)  # Insert into database
+```
+
+#### Why This Approach?
+
+1. **Minimal Latency**: 
+   - Events are queued in microseconds without waiting for database I/O
+   - HTTP response is sent immediately after queuing
+   - Database writes happen asynchronously in the background
+
+2. **Simplicity**: 
+   - No external dependencies (Redis, Kafka, etc.) required
+   - Works out-of-the-box with Python standard library
+   - Easy to understand and debug
+
+3. **Reliability**:
+   - File-based persistence ensures events aren't lost if the processor restarts
+   - Cross-process file locking prevents data corruption
+   - Queue file acts as a buffer during high traffic
+
+4. **Separation of Concerns**:
+   - Ingestion API focuses solely on receiving and queuing events
+   - Processor handles all database operations independently
+   - Services can be scaled or restarted independently
+
+#### Real-World Alternatives
+
+For production environments, consider these alternatives:
 
 - **Redis**: In-memory data store with pub/sub capabilities, excellent for high-throughput queuing
+  - Pros: Fast, supports pub/sub, built-in persistence options
+  - Cons: Requires separate service, additional infrastructure
+
 - **Apache Kafka**: Distributed event streaming platform, ideal for large-scale event processing
+  - Pros: High throughput, distributed, durable, supports replay
+  - Cons: Complex setup, requires Zookeeper/Kafka cluster
+
 - **RabbitMQ**: Message broker with advanced routing and reliability features
+  - Pros: Reliable, supports complex routing, message acknowledgments
+  - Cons: Requires separate service, more complex than needed for simple queuing
+
 - **Amazon SQS / Google Cloud Pub/Sub**: Managed queue services for cloud deployments
+  - Pros: Fully managed, scalable, no infrastructure to maintain
+  - Cons: Vendor lock-in, costs scale with usage
 
 These alternatives provide:
 - Better scalability and distributed processing
-- Durability and message persistence
+- Enhanced durability and message persistence
 - Advanced features like message acknowledgments, retries, and dead-letter queues
 - Better monitoring and observability
+- Production-grade reliability and fault tolerance
 
 ### Service Interaction
 
@@ -122,11 +178,28 @@ This asynchronous pattern ensures that:
 
 ## Database Schema
 
+### Database Overview
+
+The system uses a **SQLite database** (`analytics.db`) to store all analytics events. SQLite is chosen for simplicity and zero-configuration setup, making it ideal for development and small-to-medium scale deployments.
+
 ### Events Table
 
-The system uses a SQLite database with a single `events` table to store all analytics events.
+The database contains a single `events` table that stores all analytics events.
 
-**Table: `events`**
+#### Schema Diagram
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        events                                │
+├─────────────┬──────────┬──────────────┬──────┬──────┬───────┤
+│ id          │ site_id  │ event_type   │ path │ user │ time  │
+│ (PK, AI)    │ (NN)     │ (NN)         │      │ _id  │ stamp │
+├─────────────┼──────────┼──────────────┼──────┼──────┼───────┤
+│ INTEGER     │ TEXT     │ TEXT         │ TEXT │ TEXT │ TEXT  │
+└─────────────┴──────────┴──────────────┴──────┴──────┴───────┘
+```
+
+#### Table Structure
 
 | Column      | Type    | Constraints              | Description                          |
 |-------------|---------|--------------------------|--------------------------------------|
@@ -137,81 +210,237 @@ The system uses a SQLite database with a single `events` table to store all anal
 | `user_id`   | TEXT    | NULL                     | Identifier for the user              |
 | `timestamp` | TEXT    | NULL                     | ISO 8601 timestamp of the event      |
 
-**Example Data:**
-```
-id | site_id      | event_type | path      | user_id    | timestamp
----|--------------|------------|-----------|------------|-------------------
-1  | site-abc-123 | page_view  | /pricing  | user-xyz-1 | 2025-11-12T19:30:01Z
-2  | site-abc-123 | page_view  | /blog     | user-xyz-2 | 2025-11-12T19:31:15Z
+#### SQL Definition
+
+```sql
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    path TEXT,
+    user_id TEXT,
+    timestamp TEXT
+);
 ```
 
-The database file (`analytics.db`) is automatically created and initialized when the Processor service starts.
+#### Example Data
+
+```
+id | site_id      | event_type | path         | user_id    | timestamp
+---|--------------|------------|--------------|------------|-------------------
+1  | site-abc-123 | page_view  | /pricing     | user-xyz-1 | 2025-11-12T19:30:01Z
+2  | site-abc-123 | page_view  | /blog        | user-xyz-2 | 2025-11-12T19:31:15Z
+3  | site-abc-123 | click      | /pricing     | user-xyz-1 | 2025-11-12T19:32:00Z
+4  | site-def-456 | page_view  | /home        | user-abc-1 | 2025-11-12T19:33:00Z
+```
+
+#### Database Initialization
+
+The database file (`analytics.db`) is **automatically created and initialized** when the Processor service starts. No manual setup is required. The Processor will:
+
+1. Check if `analytics.db` exists
+2. Create the database file if it doesn't exist
+3. Create the `events` table with the proper schema
+4. Log the initialization status
+
+#### Notes
+
+- **File Location**: The database file is created in the same directory as the application
+- **Concurrency**: SQLite handles concurrent reads well, but writes are serialized
+- **Scalability**: For high-traffic production use, consider migrating to PostgreSQL or MySQL
+- **Backup**: The database is a single file that can be easily backed up or copied
 
 ## Setup Instructions
 
 ### Prerequisites
 
-- Python 3.7 or higher
-- pip (Python package manager)
+- **Python 3.7 or higher** (Python 3.8+ recommended)
+- **pip** (Python package manager - usually comes with Python)
+- **Git** (optional, for cloning the repository)
 
-### Step 1: Clone the Repository
+### Step 1: Get the Project
+
+#### Option A: Clone from Git Repository
 
 ```bash
 git clone <repository-url>
 cd tjra
 ```
 
+#### Option B: Download and Extract
+
+Download the project files and extract them to a directory, then navigate to it:
+
+```bash
+cd tjra
+```
+
 ### Step 2: Install Dependencies
 
-Install the required Python packages:
+Install the required Python packages using pip.
+
+#### On Linux/Mac:
 
 ```bash
 pip install -r requirements.txt
 ```
 
+Or if you need to use `pip3`:
+
+```bash
+pip3 install -r requirements.txt
+```
+
+#### On Windows:
+
+```cmd
+pip install -r requirements.txt
+```
+
+Or if you need to use `python -m pip`:
+
+```cmd
+python -m pip install -r requirements.txt
+```
+
+**Note:** If you encounter permission errors, you may need to use:
+- Linux/Mac: `pip install --user -r requirements.txt`
+- Windows: Run Command Prompt as Administrator
+
 This will install:
-- Flask 3.0.0 (HTTP framework)
-- Werkzeug 3.0.1 (WSGI utilities)
+- **Flask 3.0.0** - HTTP framework for the API
+- **Werkzeug 3.0.1** - WSGI utilities (dependency of Flask)
+- **requests 2.31.0** - HTTP library for test scripts
 
-### Step 3: Initialize the Database
+### Step 3: Verify Installation
 
-The database is automatically initialized when you start the Processor service. The Processor will:
+Verify that Python and required packages are installed:
+
+```bash
+python --version  # Should show Python 3.7 or higher
+python -c "import flask; print(flask.__version__)"  # Should show 3.0.0
+```
+
+### Step 4: Initialize the Database
+
+**No manual database setup required!** The database is automatically initialized when you start the Processor service. The Processor will:
+
 - Create the `analytics.db` SQLite database file (if it doesn't exist)
 - Create the `events` table with the proper schema
+- Log the initialization status
 
-**Note:** You don't need to manually initialize the database. Simply start the Processor service and it will handle initialization.
+Simply proceed to starting the services.
 
-### Step 4: Start the Services
+### Step 5: Start the Services
 
-The system requires two services to be running:
+The system requires **two services** to be running simultaneously. You'll need **two terminal/command prompt windows**.
 
-#### Start the Ingestion/Reporting API (Service 1 & 3)
+---
 
-In one terminal:
+## Running on Windows
 
-```bash
-python ingestion_api.py
+### Terminal 1: Start the Ingestion/Reporting API
+
+1. Open **Command Prompt** or **PowerShell**
+2. Navigate to the project directory:
+   ```cmd
+   cd C:\Users\HP\Desktop\tjra
+   ```
+3. Start the API service:
+   ```cmd
+   python ingestion_api.py
+   ```
+
+You should see:
+```
+ * Running on http://0.0.0.0:5000
+ * Debug mode: on
 ```
 
-The service will start on `http://localhost:5000`
+The service is now running on `http://localhost:5000`
 
-#### Start the Processor (Service 2)
+### Terminal 2: Start the Processor
 
-In another terminal:
+1. Open a **new Command Prompt** or **PowerShell** window
+2. Navigate to the project directory:
+   ```cmd
+   cd C:\Users\HP\Desktop\tjra
+   ```
+3. Start the Processor service:
+   ```cmd
+   python processor.py
+   ```
 
-```bash
-python processor.py
+You should see:
+```
+INFO - Database initialized: analytics.db
+INFO - Processor is running. Waiting for events...
 ```
 
-The Processor will:
-- Initialize the database
-- Start processing events from the queue
-- Log operations to `processor.log` and console
+The Processor is now running and ready to process events.
 
-**Important:** Both services must be running for the system to function properly:
-- The Ingestion API receives and queues events
-- The Processor processes queued events and stores them in the database
-- The Reporting API queries the database for analytics
+---
+
+## Running on Linux/Mac
+
+### Terminal 1: Start the Ingestion/Reporting API
+
+1. Open a terminal
+2. Navigate to the project directory:
+   ```bash
+   cd ~/Desktop/tjra
+   # or wherever you placed the project
+   ```
+3. Start the API service:
+   ```bash
+   python3 ingestion_api.py
+   ```
+   (Use `python3` if `python` points to Python 2.x)
+
+You should see:
+```
+ * Running on http://0.0.0.0:5000
+ * Debug mode: on
+```
+
+The service is now running on `http://localhost:5000`
+
+### Terminal 2: Start the Processor
+
+1. Open a **new terminal** window
+2. Navigate to the project directory:
+   ```bash
+   cd ~/Desktop/tjra
+   ```
+3. Start the Processor service:
+   ```bash
+   python3 processor.py
+   ```
+
+You should see:
+```
+INFO - Database initialized: analytics.db
+INFO - Processor is running. Waiting for events...
+```
+
+The Processor is now running and ready to process events.
+
+---
+
+### Important Notes
+
+- **Both services must be running** for the system to function properly:
+  - The Ingestion API receives and queues events
+  - The Processor processes queued events and stores them in the database
+  - The Reporting API queries the database for analytics
+
+- **Keep both terminals open** while using the system
+
+- **To stop the services**: Press `Ctrl+C` in each terminal window
+
+- **Port 5000**: If port 5000 is already in use, you'll see an error. Either:
+  - Stop the service using port 5000, or
+  - Modify the port in `ingestion_api.py` (last line: `app.run(host='0.0.0.0', port=5000)`)
 
 ## Running the Services
 
@@ -246,12 +475,15 @@ For production deployments:
 
 ## API Usage
 
+This section provides example `curl` commands to test the API endpoints. Make sure both services are running before testing.
+
 ### POST /event
 
-Send analytics events to the system.
+Send analytics events to the system. This endpoint receives events and queues them for asynchronous processing.
 
-#### Basic Usage
+#### Example 1: Full Event with All Fields
 
+**Linux/Mac:**
 ```bash
 curl -X POST http://localhost:5000/event \
   -H "Content-Type: application/json" \
@@ -264,8 +496,19 @@ curl -X POST http://localhost:5000/event \
   }'
 ```
 
-#### Minimal Event (Required Fields Only)
+**Windows (Command Prompt):**
+```cmd
+curl -X POST http://localhost:5000/event -H "Content-Type: application/json" -d "{\"site_id\": \"site-abc-123\", \"event_type\": \"page_view\", \"path\": \"/pricing\", \"user_id\": \"user-xyz-789\", \"timestamp\": \"2025-11-12T19:30:01Z\"}"
+```
 
+**Windows (PowerShell):**
+```powershell
+curl.exe -X POST http://localhost:5000/event -H "Content-Type: application/json" -d '{\"site_id\": \"site-abc-123\", \"event_type\": \"page_view\", \"path\": \"/pricing\", \"user_id\": \"user-xyz-789\", \"timestamp\": \"2025-11-12T19:30:01Z\"}'
+```
+
+#### Example 2: Minimal Event (Required Fields Only)
+
+**Linux/Mac:**
 ```bash
 curl -X POST http://localhost:5000/event \
   -H "Content-Type: application/json" \
@@ -275,29 +518,44 @@ curl -X POST http://localhost:5000/event \
   }'
 ```
 
-#### Response
+**Windows (Command Prompt):**
+```cmd
+curl -X POST http://localhost:5000/event -H "Content-Type: application/json" -d "{\"site_id\": \"site-abc-123\", \"event_type\": \"page_view\"}"
+```
 
-**Success (200 OK):**
+**Note:** If `timestamp` is not provided, it will be automatically added with the current UTC time.
+
+#### Success Response (200 OK)
+
 ```json
 {
   "message": "Event received"
 }
 ```
 
-**Error (400 Bad Request):**
+#### Error Response (400 Bad Request)
+
 ```json
 {
   "error": "Missing required field: site_id"
 }
 ```
 
+---
+
 ### GET /stats
 
-Retrieve aggregated analytics data.
+Retrieve aggregated analytics data from the database. This endpoint queries the database and returns statistics.
 
-#### Get All-Time Stats for a Site
+#### Example 1: Get All-Time Stats for a Site
 
+**Linux/Mac:**
 ```bash
+curl "http://localhost:5000/stats?site_id=site-abc-123"
+```
+
+**Windows:**
+```cmd
 curl "http://localhost:5000/stats?site_id=site-abc-123"
 ```
 
@@ -316,9 +574,15 @@ curl "http://localhost:5000/stats?site_id=site-abc-123"
 }
 ```
 
-#### Get Daily Stats for a Site
+#### Example 2: Get Daily Stats for a Site
 
+**Linux/Mac:**
 ```bash
+curl "http://localhost:5000/stats?site_id=site-abc-123&date=2025-11-12"
+```
+
+**Windows:**
+```cmd
 curl "http://localhost:5000/stats?site_id=site-abc-123&date=2025-11-12"
 ```
 
@@ -337,8 +601,9 @@ curl "http://localhost:5000/stats?site_id=site-abc-123&date=2025-11-12"
 }
 ```
 
-#### No Data Found
+#### Example 3: No Data Found
 
+**Linux/Mac/Windows:**
 ```bash
 curl "http://localhost:5000/stats?site_id=nonexistent-site"
 ```
@@ -356,7 +621,7 @@ curl "http://localhost:5000/stats?site_id=nonexistent-site"
 
 #### Error Cases
 
-**Missing site_id:**
+**Missing site_id parameter:**
 ```bash
 curl "http://localhost:5000/stats"
 ```
@@ -380,10 +645,13 @@ curl "http://localhost:5000/stats?site_id=site-abc-123&date=invalid-date"
 }
 ```
 
+---
+
 ### GET /health
 
-Check the health status of the Ingestion API.
+Check the health status of the Ingestion API and view the current queue size.
 
+**Linux/Mac/Windows:**
 ```bash
 curl http://localhost:5000/health
 ```
@@ -396,6 +664,28 @@ curl http://localhost:5000/health
   "queue_size": 5
 }
 ```
+
+---
+
+### Testing Tips
+
+1. **Send multiple events** to see meaningful statistics:
+   ```bash
+   # Send several events with different paths
+   curl -X POST http://localhost:5000/event -H "Content-Type: application/json" -d '{"site_id": "site-abc-123", "event_type": "page_view", "path": "/pricing"}'
+   curl -X POST http://localhost:5000/event -H "Content-Type: application/json" -d '{"site_id": "site-abc-123", "event_type": "page_view", "path": "/blog"}'
+   curl -X POST http://localhost:5000/event -H "Content-Type: application/json" -d '{"site_id": "site-abc-123", "event_type": "page_view", "path": "/pricing"}'
+   ```
+
+2. **Wait a moment** after sending events before querying stats (to allow the Processor to process them)
+
+3. **Check the Processor terminal** to see events being processed in real-time
+
+4. **Use the test scripts** for automated testing:
+   ```bash
+   python test_ingestion.py
+   python test_reporting.py
+   ```
 
 ## Testing
 
